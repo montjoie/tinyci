@@ -20,6 +20,7 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include "driver/temperature_sensor.h"
 
 static const char *TAG = "tinyci-fw";
 
@@ -112,6 +113,24 @@ static bool relay_ctrl(char *cmd)
 	return true;
 }
 
+static int get_temp()
+{
+	temperature_sensor_handle_t temp_sensor = NULL;
+	temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+	ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
+
+	ESP_LOGI(TAG, "Enable temperature sensor");
+	ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
+
+	ESP_LOGI(TAG, "Read temperature");
+
+	float tsens_value;
+	ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
+	ESP_LOGI(TAG, "Temperature value %.02f ℃", tsens_value);
+
+	return tsens_value;
+}
+
 static void handle_cmd(int sock, struct sockaddr_in6 *source_addr,
 		       char *rx_buffer, unsigned int len)
 {
@@ -131,6 +150,16 @@ static void handle_cmd(int sock, struct sockaddr_in6 *source_addr,
 		char reply[128];
 
 		sprintf(reply, "TINYCI %s", IDF_VER);
+		int err = sendto(sock, reply, strlen(reply)+1, 0, (struct sockaddr *)source_addr, sizeof(*source_addr));
+		if (err < 0)
+			ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+		return;
+	}
+
+	if (!strncmp(rx_buffer, "TEMPERATURE", 11)) {
+		char reply[128];
+
+		sprintf(reply, "TEMP %d", get_temp());
 		int err = sendto(sock, reply, strlen(reply)+1, 0, (struct sockaddr *)source_addr, sizeof(*source_addr));
 		if (err < 0)
 			ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
