@@ -28,6 +28,8 @@ static const char *TAG = "tinyci-fw";
 #define ETH_PHY_RST_GPIO	16
 #define ETH_PHY_ADDR 		1
 
+static bool port_state[4];
+
 /** Event handler for Ethernet events */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
@@ -109,6 +111,26 @@ static bool relay_ctrl(char *cmd)
 
 	gpio_set_level(relays_gpio_map[num], enable);
 
+	port_state[num] = enable;
+
+	return true;
+}
+
+static bool relay_get(int sock, struct sockaddr_in6 *source_addr, const char *cmd)
+{
+	unsigned int num = cmd[3] - '0';
+	char reply[32];
+
+	if (num >= NUM_RELAYS)
+		return false;
+
+	sprintf(reply, "PORT%d=%d", num, port_state[num]);
+	int err = sendto(sock, reply, strlen(reply)+1, 0, (struct sockaddr *)source_addr, sizeof(*source_addr));
+	if (err < 0) {
+		ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+		return false;
+	}
+
 	return true;
 }
 
@@ -126,6 +148,11 @@ static void handle_cmd(int sock, struct sockaddr_in6 *source_addr,
 
 	ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
 	ESP_LOGI(TAG, "%s", rx_buffer);
+
+	if (!strncmp(rx_buffer, "GET", 3)) {
+		relay_get(sock, source_addr, rx_buffer);
+		return;
+	}
 
 	if (!strncmp(rx_buffer, "VERSION", 7)) {
 		char reply[128];
