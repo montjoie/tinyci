@@ -24,16 +24,23 @@ def udp_client(address, payload):
     except socket.error as msg:
         print('Could not create socket: ' + str(msg[0]) + ': ' + msg[1])
         raise
-    try:
-        sock.sendto(payload.encode(), addr)
-        reply, addr = sock.recvfrom(128)
+    retries = 0
+    while retries < 3:
+        retries += 1
+        try:
+            sock.settimeout(5)
+            sock.sendto(payload.encode(), addr)
+            reply, addr = sock.recvfrom(128)
         if not reply:
             return
         print('Reply[' + addr[0] + ':' + str(addr[1]) + '] - ' + str(reply.decode()))
-    except socket.error as msg:
-        print('Error Code : ' + str(msg[0]) + ' Message: ' + msg[1])
-        sock.close()
-        raise
+        except TimedoutError:
+            print("TIMEOUT retry=%d" % retries)
+            continue
+        except socket.error as msg:
+            print('Error Code : ' + str(msg[0]) + ' Message: ' + msg[1])
+            sock.close()
+            raise
     return reply
 
 

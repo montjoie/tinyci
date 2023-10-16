@@ -14,19 +14,111 @@
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include <apps/ping/ping_sock.h>
 
 static const char *TAG = "tinyci-fw";
+static bool has_ip;
+static int net_timeout;
+static int ping_status;
+static esp_ping_handle_t ping;
 
 #define ETH_MDC_GPIO		23
 #define ETH_MDIO_GPIO		18
 #define ETH_PHY_RST_GPIO	16
 #define ETH_PHY_ADDR 		1
+
+static void test_on_ping_success(esp_ping_handle_t hdl, void *args)
+{
+    uint8_t ttl;
+    uint16_t seqno;
+    uint32_t elapsed_time, recv_len;
+    ip_addr_t target_addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TTL, &ttl, sizeof(ttl));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &target_addr, sizeof(target_addr));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SIZE, &recv_len, sizeof(recv_len));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed_time, sizeof(elapsed_time));
+    printf("%ld bytes from %s icmp_seq=%d ttl=%d time=%ld ms\n",
+           recv_len, inet_ntoa(target_addr.u_addr.ip4), seqno, ttl, elapsed_time);
+    esp_ping_stop(&ping);
+    ping_status = 1;
+}
+
+static void test_on_ping_timeout(esp_ping_handle_t hdl, void *args)
+{
+    uint16_t seqno;
+    ip_addr_t target_addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &target_addr, sizeof(target_addr));
+    printf("From %s icmp_seq=%d timeout\n", inet_ntoa(target_addr.u_addr.ip4), seqno);
+    esp_ping_stop(&ping);
+    ping_status = 1;
+}
+
+static void test_on_ping_end(esp_ping_handle_t hdl, void *args)
+{
+    uint32_t transmitted;
+    uint32_t received;
+    uint32_t total_time_ms;
+
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &received, sizeof(received));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_DURATION, &total_time_ms, sizeof(total_time_ms));
+    printf("%ld packets transmitted, %ld received, time %ldms\n", transmitted, received, total_time_ms);
+    esp_ping_stop(&ping);
+    ping_status = 1;
+}
+
+# define PING_INTERVAL 500
+static void doping() {
+	int err;
+
+	if (!has_ip) {
+        	ESP_LOGI(TAG, "Cannot ping, no net");
+		net_timeout++;
+		return;
+	}
+	if (ping_status == 0)
+		goto ping_init;
+	if (ping_status < PING_INTERVAL) {
+		ping_status ++;
+		return;
+	}
+	if (ping_status >= PING_INTERVAL) {
+		esp_ping_start(ping);
+		return;
+	}
+ping_init:
+	ip_addr_t target_addr;
+	struct addrinfo hint;
+	struct addrinfo *res = NULL;
+	memset(&hint, 0, sizeof(hint));
+	memset(&target_addr, 0, sizeof(target_addr));
+	getaddrinfo("192.168.1.1", NULL, &hint, &res);
+	struct in_addr addr4 = ((struct sockaddr_in *) (res->ai_addr))->sin_addr;
+	inet_addr_to_ip4addr(ip_2_ip4(&target_addr), &addr4);
+	freeaddrinfo(res);
+	esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+	ping_config.target_addr = target_addr;
+
+	esp_ping_callbacks_t cbs;
+	cbs.on_ping_success = test_on_ping_success;
+	cbs.on_ping_timeout = test_on_ping_timeout;
+	cbs.on_ping_end = test_on_ping_end;
+	cbs.cb_args = "foo";
+	/*cbs.cb_args = eth_event_group;*/
+
+	err = esp_ping_new_session(&ping_config, &cbs, &ping);
+	printf("PING ERR=%d\n", err);
+	ping_status = 1;
+}
 
 /** Event handler for Ethernet events */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
@@ -70,6 +162,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
     ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
     ESP_LOGI(TAG, "~~~~~~~~~~~");
+    has_ip = 1;
 }
 
 #define NUM_RELAYS	4
@@ -155,6 +248,7 @@ static void udp_server_task(void *pvParameters)
     int addr_family = (int)pvParameters;
     int ip_protocol = 0;
     struct sockaddr_in6 dest_addr;
+    struct pollfd popol[1];
 
     while (1) {
 
@@ -184,7 +278,30 @@ static void udp_server_task(void *pvParameters)
         ESP_LOGI(TAG, "Socket bound, port %d", PORT);
 
         while (1) {
-
+retry:
+	    doping();
+	    popol[0].fd = sock;
+	    popol[0].events = POLLERR | POLLHUP | POLLIN | POLLPRI;
+	    err = poll(popol, 1, 100);
+	    if (err == -1) {
+            	ESP_LOGE(TAG, "POLL ERROR\n");
+		goto retry;
+	    }
+	    if (popol[0].revents & POLLERR) {
+            	ESP_LOGE(TAG, "POLL ERR\n");
+	    }
+	    if (popol[0].revents & POLLPRI) {
+            	ESP_LOGE(TAG, "POLL PRI\n");
+	    }
+	    if (popol[0].revents & POLLHUP) {
+            	ESP_LOGE(TAG, "POLL HUP\n");
+	    }
+	    if (popol[0].revents & POLLIN) {
+            	ESP_LOGE(TAG, "POLL IN\n");
+		goto get;
+	    }
+	    goto retry;
+get:
             struct sockaddr_in6 source_addr; // Large enough for both IPv4 or IPv6
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
